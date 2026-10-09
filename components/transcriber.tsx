@@ -8,6 +8,9 @@ import {
   Eye,
   EyeOff,
   LoaderCircle,
+  RotateCcw,
+  Scissors,
+  Undo2,
   Upload,
   X,
 } from "lucide-react";
@@ -22,6 +25,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   activeWordIndex,
+  applyRemovals,
   formatBytes,
   formatTimestamp,
   isAllowedAudio,
@@ -91,6 +95,11 @@ export function Transcriber() {
   const [view, setView] = useState<View>("reading");
   const [copied, setCopied] = useState<CopyKind | null>(null);
   const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(1);
+  const [editing, setEditing] = useState(false);
+  const [removed, setRemoved] = useState<ReadonlySet<number>>(() => new Set());
+  const [history, setHistory] = useState<ReadonlySet<number>[]>([]);
+  const [skipRemoved, setSkipRemoved] = useState(true);
+  const anchorRef = useRef<number | null>(null);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const activeWordRef = useRef<HTMLButtonElement>(null);
@@ -136,7 +145,59 @@ export function Transcriber() {
     setProgress(null);
     setChunkProgress(null);
     setStatus("idle");
+    resetRemovals();
   }
+
+  function resetRemovals() {
+    setRemoved(new Set());
+    setHistory([]);
+    anchorRef.current = null;
+  }
+
+  /** Strike a word out (or bring it back); shift-click applies to the whole range. */
+  function toggleWord(index: number, range: boolean) {
+    const next = new Set(removed);
+    const anchor = anchorRef.current;
+    if (range && anchor != null && anchor !== index) {
+      const from = Math.min(anchor, index);
+      const to = Math.max(anchor, index);
+      const remove = !removed.has(index);
+      for (let i = from; i <= to; i++) {
+        if (remove) next.add(i);
+        else next.delete(i);
+      }
+    } else if (next.has(index)) {
+      next.delete(index);
+    } else {
+      next.add(index);
+    }
+    anchorRef.current = index;
+    setHistory((past) => [...past, removed]);
+    setRemoved(next);
+  }
+
+  function undoRemoval() {
+    const previous = history.at(-1);
+    if (!previous) return;
+    setHistory((past) => past.slice(0, -1));
+    setRemoved(previous);
+  }
+
+  /** While playing, jump over struck-out words so the preview sounds like the edit. */
+  function skipOverRemoved(time: number) {
+    const audio = audioRef.current;
+    if (!audio || !transcript || !skipRemoved || removed.size === 0 || audio.paused) return;
+    const words = transcript.words;
+    let index = activeWordIndex(words, time);
+    if (index < 0 || !removed.has(index)) return;
+    while (index < words.length && removed.has(index)) index++;
+    audio.currentTime = index < words.length ? words[index].start : (audio.duration || time);
+  }
+
+  const edited = useMemo(
+    () => (transcript ? applyRemovals(transcript, removed) : null),
+    [transcript, removed],
+  );
 
   const costEstimate = useMemo(
     () => (audioDuration != null ? estimateGeminiTranscribeCost(audioDuration) : null),
@@ -162,6 +223,7 @@ export function Transcriber() {
     setTranscript(null);
     setCurrentTime(0);
     setChunkProgress(null);
+    resetRemovals();
     setProgress("অডিও প্রস্তুত করা হচ্ছে…");
 
     try {
@@ -251,8 +313,8 @@ export function Transcriber() {
   }
 
   async function copy(kind: CopyKind) {
-    if (!transcript) return;
-    const value = kind === "text" ? transcript.text : transcriptToTimedText(transcript);
+    if (!edited) return;
+    const value = kind === "text" ? edited.text : transcriptToTimedText(edited);
     try {
       await navigator.clipboard.writeText(value);
       setCopied(kind);
@@ -264,10 +326,10 @@ export function Transcriber() {
   }
 
   function download(kind: "txt" | "json") {
-    if (!transcript || !file) return;
+    if (!edited || !file) return;
     const base = file.name.replace(/\.[^.]+$/, "") || "transcript";
     const contents =
-      kind === "json" ? JSON.stringify(transcript, null, 2) : transcriptToTimedText(transcript);
+      kind === "json" ? JSON.stringify(edited, null, 2) : transcriptToTimedText(edited);
     const blob = new Blob([contents], {
       type: kind === "json" ? "application/json" : "text/plain;charset=utf-8",
     });
@@ -280,6 +342,7 @@ export function Transcriber() {
   }
 
   const wordCount = transcript?.words.length ?? 0;
+  const keptCount = edited?.words.length ?? 0;
 
   return (
     <div className="mx-auto grid w-full max-w-6xl gap-6 md:grid-cols-[minmax(280px,380px)_minmax(0,1fr)]">
@@ -355,6 +418,7 @@ export function Transcriber() {
                           setProgress(null);
                           setChunkProgress(null);
                           setStatus("idle");
+                          resetRemovals();
                         }}
                       >
                         <X className="size-4" />
@@ -372,7 +436,11 @@ export function Transcriber() {
                           typeof d === "number" && Number.isFinite(d) && d > 0 ? d : null,
                         );
                       }}
-                      onTimeUpdate={() => setCurrentTime(audioRef.current?.currentTime ?? 0)}
+                      onTimeUpdate={() => {
+                        const time = audioRef.current?.currentTime ?? 0;
+                        setCurrentTime(time);
+                        skipOverRemoved(time);
+                      }}
                       onSeeked={() => setCurrentTime(audioRef.current?.currentTime ?? 0)}
                       onPlay={() => {
                         if (audioRef.current) audioRef.current.playbackRate = speed;
@@ -500,11 +568,24 @@ export function Transcriber() {
               {status === "loading" && chunkProgress
                 ? `${chunkProgress.done}/${chunkProgress.total} চাঙ্ক রেডি${wordCount ? ` · ${wordCount}টা শব্দ এখনো পর্যন্ত` : ""}`
                 : transcript
-                  ? `${wordCount}টা শব্দ${transcript.language ? ` · ${transcript.language}` : ""}`
+                  ? `${wordCount}টা শব্দ${removed.size ? ` · ${removed.size}টা কাটা · ${keptCount}টা থাকবে` : ""}${transcript.language ? ` · ${transcript.language}` : ""}`
                   : "একটা শব্দে ক্লিক করলে অডিও সেখান থেকে বাজবে।"}
             </p>
           </div>
           {transcript && wordCount > 0 ? (
+            <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              aria-pressed={editing}
+              onClick={() => setEditing((value) => !value)}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-sm",
+                editing ? "bg-red-600 text-white" : "bg-muted text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <Scissors className="size-4" />
+              এডিট
+            </button>
             <div className="inline-flex rounded-lg bg-muted p-0.5">
               {(
                 [
@@ -524,6 +605,7 @@ export function Transcriber() {
                   {label}
                 </button>
               ))}
+            </div>
             </div>
           ) : null}
         </div>
@@ -557,6 +639,45 @@ export function Transcriber() {
                 </button>
               ))}
             </div>
+          </div>
+        ) : null}
+
+        {transcript && wordCount > 0 && (editing || removed.size > 0) ? (
+          <div className="flex flex-wrap items-center gap-2 rounded-xl bg-red-50 px-4 py-2.5 text-sm text-red-900 ring-1 ring-red-200">
+            <span className="min-w-0 flex-1">
+              {editing
+                ? "শব্দে ক্লিক করলে কেটে যাবে, আবার ক্লিক করলে ফেরত আসবে। Shift+ক্লিকে একসাথে অনেকগুলো।"
+                : `${removed.size}টা শব্দ কাটা আছে — কপি/ডাউনলোডে এগুলো থাকবে না।`}
+            </span>
+            <label className="inline-flex items-center gap-1.5 text-xs">
+              <input
+                type="checkbox"
+                checked={skipRemoved}
+                onChange={(event) => setSkipRemoved(event.target.checked)}
+              />
+              বাজানোর সময় কাটা অংশ বাদ
+            </label>
+            <button
+              type="button"
+              onClick={undoRemoval}
+              disabled={history.length === 0}
+              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs hover:bg-red-100 disabled:opacity-40"
+            >
+              <Undo2 className="size-3.5" />
+              আনডু
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setHistory((past) => [...past, removed]);
+                setRemoved(new Set());
+              }}
+              disabled={removed.size === 0}
+              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs hover:bg-red-100 disabled:opacity-40"
+            >
+              <RotateCcw className="size-3.5" />
+              সব ফেরত আনুন
+            </button>
           </div>
         ) : null}
 
@@ -636,6 +757,7 @@ export function Transcriber() {
               {transcript.words.map((word, index) => {
                 const active = index === activeIndex;
                 const played = activeIndex > index;
+                const cut = removed.has(index);
                 return (
                   <button
                     key={`${word.start}-${index}`}
@@ -643,12 +765,18 @@ export function Transcriber() {
                     type="button"
                     title={`${formatTimestamp(word.start)} – ${formatTimestamp(word.end)}`}
                     aria-current={active ? "true" : undefined}
-                    onClick={() => seek(word.start)}
+                    aria-pressed={editing ? cut : undefined}
+                    onClick={(event) =>
+                      editing ? toggleWord(index, event.shiftKey) : seek(word.start)
+                    }
                     className={cn(
-                      "rounded-md px-1.5 py-0.5 text-left text-[1.05rem] leading-8 transition-colors",
-                      active && "bg-stone-900 text-white",
-                      !active && played && "text-stone-400 hover:bg-stone-100 hover:text-stone-900",
-                      !active && !played && "hover:bg-stone-100",
+                      "rounded-md px-1.5 py-0.5 text-left text-[1.05rem] leading-8 transition-colors select-none",
+                      cut && "text-red-500/70 line-through decoration-red-500 decoration-2",
+                      cut && editing && "bg-red-50 hover:bg-red-100",
+                      !cut && editing && "hover:bg-red-50 hover:text-red-700",
+                      !cut && active && "bg-stone-900 text-white",
+                      !cut && !editing && !active && played && "text-stone-400 hover:bg-stone-100 hover:text-stone-900",
+                      !cut && !editing && !active && !played && "hover:bg-stone-100",
                     )}
                   >
                     {word.word}
@@ -672,14 +800,24 @@ export function Transcriber() {
                 <tbody>
                   {transcript.words.map((word, index) => {
                     const active = index === activeIndex;
+                    const cut = removed.has(index);
                     return (
-                      <tr key={`${word.start}-${index}`} className={cn("border-b last:border-0", active && "bg-stone-900 text-white")}>
+                      <tr
+                        key={`${word.start}-${index}`}
+                        className={cn(
+                          "border-b last:border-0",
+                          cut && "text-red-500/70 line-through",
+                          !cut && active && "bg-stone-900 text-white",
+                        )}
+                      >
                         <td className="px-4 py-2 font-mono text-xs">{index + 1}</td>
                         <td className="px-4 py-2">
                           <button
                             ref={active ? activeWordRef : undefined}
                             type="button"
-                            onClick={() => seek(word.start)}
+                            onClick={(event) =>
+                              editing ? toggleWord(index, event.shiftKey) : seek(word.start)
+                            }
                             className="text-left"
                           >
                             {word.word}
@@ -698,15 +836,15 @@ export function Transcriber() {
 
         {transcript && (transcript.text || wordCount > 0) ? (
           <div className="flex flex-wrap gap-2">
-            <Button type="button" variant="outline" onClick={() => copy("text")} disabled={!transcript.text}>
+            <Button type="button" variant="outline" onClick={() => copy("text")} disabled={!edited?.text}>
               {copied === "text" ? <Check /> : <Copy />}
               পুরো লেখা
             </Button>
-            <Button type="button" variant="outline" onClick={() => copy("timed")} disabled={wordCount === 0}>
+            <Button type="button" variant="outline" onClick={() => copy("timed")} disabled={keptCount === 0}>
               {copied === "timed" ? <Check /> : <Copy />}
               সময়সহ
             </Button>
-            <Button type="button" variant="outline" onClick={() => download("txt")} disabled={wordCount === 0}>
+            <Button type="button" variant="outline" onClick={() => download("txt")} disabled={keptCount === 0}>
               <Download />
               .txt
             </Button>
